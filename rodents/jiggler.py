@@ -7,15 +7,46 @@ import random
 import threading
 import platform
 import argparse
+import atexit
+
+# How long (seconds) the user must be idle before the jiggler resumes
+IDLE_RESUME_SECONDS = 4 * 60  # 4 minutes
+
+# Shared state protected by a lock
+_activity_lock = threading.Lock()
+_last_activity_time = None   # None means the jiggler has never been paused
+_user_active = False         # True while the user is considered active (jiggler paused)
 
 
-def check_key_press():
+def _record_activity():
+    """Record that the user just did something (key press or mouse move)."""
+    global _last_activity_time, _user_active
+    with _activity_lock:
+        _last_activity_time = time.time()
+        if not _user_active:
+            logging.info("User activity detected – pausing jiggler.")
+        _user_active = True
+
+
+def _resume_jiggler():
+    """Mark the jiggler as active again after the idle timeout has elapsed."""
+    global _user_active
+    with _activity_lock:
+        _user_active = False
+
+
+def _monitor_mouse(poll_interval=0.5):
     """
-    Function to monitor key presses and stop the execution of the loop when a key is pressed.
+    Background thread: poll the mouse position every *poll_interval* seconds.
+    If it has moved since the last poll, treat that as user activity.
     """
-    global continue_execution
-    keyboard.wait()  # Wait for any key press
-    continue_execution = False
+    prev_pos = pyautogui.position()
+    while True:
+        time.sleep(poll_interval)
+        cur_pos = pyautogui.position()
+        if cur_pos != prev_pos:
+            _record_activity()
+        prev_pos = cur_pos
 
 
 def switch_to_next_tab():
@@ -52,6 +83,10 @@ def switch_to_previous_tab():
 def main(delay_mean, delay_std_dev, move_duration):
     """
     Main function to execute the program.
+
+    The jiggler runs while the machine is idle.  As soon as the user moves the
+    mouse or presses a key the jiggler pauses.  After the machine has been idle
+    for IDLE_RESUME_SECONDS (4 minutes) the jiggler automatically resumes.
     """
     # Set up basic logging configuration
     logging.basicConfig(
@@ -69,16 +104,6 @@ def main(delay_mean, delay_std_dev, move_duration):
     std_dev_x = screen_width / 6
     std_dev_y = screen_height / 6
 
-    # Set the parameters for the delay distribution
-    delay_mean = delay_mean
-    delay_std_dev = delay_std_dev
-
-    # Set the time lapse for the mouse movement
-    move_duration = move_duration
-
-    # Flag to control the execution of the loop
-    continue_execution = True
-
     # Define a list of commands using lambda expressions and their descriptions
     commands = [
         {
@@ -95,48 +120,81 @@ def main(delay_mean, delay_std_dev, move_duration):
         },
     ]
 
-    # Start a separate thread to monitor key presses
-    key_thread = threading.Thread(target=check_key_press)
-    key_thread.start()
+    # Register a keyboard hook so any key press is treated as user activity
+    keyboard.on_press(lambda _: _record_activity())
+    atexit.register(keyboard.unhook_all)
+
+    # Start a background thread to detect mouse movement
+    mouse_thread = threading.Thread(target=_monitor_mouse, daemon=True)
+    mouse_thread.start()
+
+    logging.info(
+        "Jiggler started. It will pause on user activity and resume after %d minutes of idle.",
+        IDLE_RESUME_SECONDS // 60,
+    )
 
     while True:
-        while continue_execution:
-            # Sample x and y coordinates from the 2D normal distribution
-            x, y = np.random.multivariate_normal(
-                mean, [[std_dev_x**2, 0], [0, std_dev_y**2]]
+        # Check whether the user is currently active
+        with _activity_lock:
+            active = _user_active
+            idle_seconds = (
+                time.time() - _last_activity_time if _last_activity_time is not None else None
             )
 
-            # Clamp the values to be within the screen boundaries
-            x, y = max(0, min(x, screen_width - 1)), max(0, min(y, screen_height - 1))
-
-            # Choose a random command from the commands list
-            random_command = random.choice(commands)
-
-            # Execute the random command
-            if random_command["description"] == "Moved mouse to position":
-                random_command["command"](x, y, move_duration)
+        if active:
+            # Has the machine been idle long enough to resume?
+            if idle_seconds is not None and idle_seconds >= IDLE_RESUME_SECONDS:
+                _resume_jiggler()
+                logging.info(
+                    "Idle for %.0f seconds – resuming jiggler.", idle_seconds
+                )
             else:
-                random_command["command"]()
+                remaining = (
+                    IDLE_RESUME_SECONDS - idle_seconds
+                    if idle_seconds is not None
+                    else IDLE_RESUME_SECONDS
+                )
+                logging.debug("Jiggler paused. Resuming in %.0f seconds.", remaining)
+                time.sleep(1)
+                continue
 
-            # Log the executed command
-            logging.info("%s", random_command["description"])
+        # --- Jiggler is active: perform a random action ---
 
-            # Sample a delay from the normal distribution
-            delay = np.random.normal(delay_mean, delay_std_dev)
+        # Sample x and y coordinates from the 2D normal distribution
+        x, y = np.random.multivariate_normal(
+            mean, [[std_dev_x**2, 0], [0, std_dev_y**2]]
+        )
 
-            # Clamp the delay to be non-negative
-            delay = max(0, delay)
+        # Clamp the values to be within the screen boundaries
+        x, y = max(0, min(x, screen_width - 1)), max(0, min(y, screen_height - 1))
 
-            # Log the delay
-            logging.info("Delaying next movement for %.2f seconds", delay)
+        # Choose a random command from the commands list
+        random_command = random.choice(commands)
 
-            # Delay the next iteration
-            time.sleep(delay)
+        # Execute the random command
+        if random_command["description"] == "Moved mouse to position":
+            random_command["command"](x, y, move_duration)
+        else:
+            random_command["command"]()
 
-        # Reset the flag to continue execution
-        continue_execution = True
+        # Log the executed command
+        logging.info("%s", random_command["description"])
 
-    logging.info("Key pressed. Exiting program.")
+        # Sample a delay from the normal distribution
+        delay = max(0, np.random.normal(delay_mean, delay_std_dev))
+
+        # Log the delay
+        logging.info("Delaying next movement for %.2f seconds", delay)
+
+        # Delay the next iteration (in small increments so activity is detected quickly)
+        elapsed = 0.0
+        while elapsed < delay:
+            chunk = min(0.5, delay - elapsed)
+            time.sleep(chunk)
+            elapsed += chunk
+            with _activity_lock:
+                if _user_active:
+                    break
 
 
 def run_jiggler():
